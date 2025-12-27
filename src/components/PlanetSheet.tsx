@@ -105,25 +105,115 @@ function PlanetNodesPanel({
     placePointAtClient(ev.clientX, ev.clientY);
   };
 
-  // Android fix: React's touch handlers may be passive, causing taps to be ignored.
-  // We attach a non-passive native touchstart listener to reliably capture short taps.
+  // Android fix: React's touch handlers may be passive, causing short taps to be ignored.
+  // We attach ONE non-passive native touchstart listener for the lifetime of the component,
+  // and read the latest state through refs. This avoids a subtle issue on mobile where the
+  // listener is re-attached on each render (after adding a node), and the *first tap* after
+  // toggling edit mode can be missed, making it feel like a "double tap" is required.
+  const pointsRef = React.useRef(points);
+  const activeRef = React.useRef(active);
+  const editRef = React.useRef(editMode);
+
+  // Toggle edit mode and update the ref synchronously.
+  // This fixes an Android quirk where the very first tap after enabling edit mode
+  // can read a stale "false" value (making it feel like a double-tap is required).
+  const toggleEditMode = () => {
+    setEditMode((v) => {
+      const nv = !v;
+      editRef.current = nv;
+      // On Android, if an <input> was focused (keyboard open), the first tap on the image
+      // is often consumed just to dismiss the keyboard. Blurring immediately when entering
+      // edit mode ensures the very next tap places a node (single-tap behavior).
+      if (nv) {
+        try {
+          const ae = document.activeElement as HTMLElement | null;
+          ae?.blur?.();
+        } catch {
+          // ignore
+        }
+      }
+      return nv;
+    });
+  };
+
+  // Keep refs in sync *synchronously* on every render so the very first tap
+  // after enabling edit mode is not missed on Android.
+  pointsRef.current = points;
+  activeRef.current = active;
+  editRef.current = editMode;
+
+  // Android quirk: a quick tap can be consumed as a scroll/focus gesture.
+  // The most reliable approach is to treat a TAP on *touchend* (after we know it wasn't a scroll)
+  // using a non-passive listener, while still preventing the browser from stealing the gesture.
+  // This fixes the "double tap required" issue seen on some Android phones/tablets.
+  const touchStartRef = React.useRef<{ x: number; y: number; t: number } | null>(null);
+
   useEffect(() => {
     const el = wrapRef.current;
     if (!el) return;
-    if (!editMode) return;
 
-    const handler = (e: TouchEvent) => {
-      lastTouchRef.current = Date.now();
-      // Non-passive listener => preventDefault actually works, so the browser won't swallow the tap.
-      e.preventDefault();
-      const t = e.touches[0] ?? e.changedTouches[0];
-      if (!t) return;
-      placePointAtClient(t.clientX, t.clientY);
+    const getRect = () => {
+      const wrap = wrapRef.current;
+      const imgRect = imgRef.current?.getBoundingClientRect();
+      return imgRect ?? wrap?.getBoundingClientRect() ?? null;
     };
 
-    el.addEventListener('touchstart', handler, { passive: false });
-    return () => el.removeEventListener('touchstart', handler as any);
-  }, [editMode, placePointAtClient]);
+    const onTouchStart = (e: TouchEvent) => {
+      if (!editRef.current) return;
+      lastTouchRef.current = Date.now();
+      // Non-passive => preventDefault works. This stops the browser from converting the tap into a scroll
+      // and avoids Android's double-tap-to-zoom heuristics from delaying the action.
+      e.preventDefault();
+      const t = e.touches[0];
+      if (!t) return;
+
+      const rect = getRect();
+      if (!rect) return;
+      const nx = (t.clientX - rect.left) / rect.width;
+      const ny = (t.clientY - rect.top) / rect.height;
+
+      // Hit-test: if user taps on an existing node, delete it.
+      const currentPoints = pointsRef.current;
+      const currentActive = activeRef.current;
+      const R = 22; // tap radius in px
+      let hit = -1;
+      for (let i = 0; i < currentPoints.length; i++) {
+        const px = currentPoints[i]?.x ?? 0;
+        const py = currentPoints[i]?.y ?? 0;
+        const hdx = (px - nx) * rect.width;
+        const hdy = (py - ny) * rect.height;
+        if (hdx * hdx + hdy * hdy <= R * R) {
+          hit = i;
+          break;
+        }
+      }
+
+      if (hit >= 0) {
+        const nextPoints = currentPoints.filter((_, i) => i !== hit);
+        const nextActive = currentActive.filter((_, i) => i !== hit);
+        store.savePlanet(planetId, { nodePoints: nextPoints, nodeActive: nextActive });
+        return;
+      }
+
+      // Otherwise create a new node.
+      store.savePlanet(planetId, {
+        nodePoints: [...currentPoints, { x: nx, y: ny }],
+        nodeActive: [...currentActive, false],
+      });
+    };
+
+    // We intentionally do NOT use touchend for placement. Android/Chrome may delay
+    // the finalization of a "tap" gesture (double-tap heuristics), which makes it
+    // feel like a single tap requires two taps. We place/delete immediately on touchstart.
+
+    // Capture so we receive the event before the browser begins interpreting it as a scroll.
+    el.addEventListener('touchstart', onTouchStart, { passive: false, capture: true });
+    return () => {
+      el.removeEventListener('touchstart', onTouchStart as any, true);
+    };
+    // Intentionally attach once; handler reads latest state through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [store, planetId]);
 
   const removePoint = (idx: number) => {
     const nextPoints = points.filter((_, i) => i !== idx);
@@ -140,7 +230,7 @@ function PlanetNodesPanel({
       <div className="row between">
         <div className="nodes-title">Ramificación de nodos</div>
         <div className="row wrap">
-          <button className="ghost" type="button" onClick={() => setEditMode((v) => !v)} disabled={!planetNumber}>
+          <button className="ghost" type="button" onClick={toggleEditMode} disabled={!planetNumber}>
             {editMode ? 'Terminar edición' : 'Editar nodos'}
           </button>
           {editMode ? (
@@ -158,6 +248,9 @@ function PlanetNodesPanel({
           className={`nodes-image-wrap ${editMode ? 'editing' : ''}`}
           ref={wrapRef}
           onPointerDown={addPointFromPointer}
+          // Critical for Android: prevents double-tap-to-zoom and ensures a single tap
+          // is delivered immediately to our handlers.
+          style={{ touchAction: editMode ? 'none' : 'pan-y' }}
         >
           {imgOk ? (
             <img
